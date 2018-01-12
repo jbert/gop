@@ -13,6 +13,7 @@
 package gop
 
 import (
+	"bufio"
 	"encoding/json"
 	"os"
 
@@ -25,19 +26,18 @@ import (
 	"net"
 	"net/http"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
 // Stuff we include in both App and Req, for convenience
 type common struct {
 	Logger
-	loggerIndex int
-	Cfg         Config
-	Stats       StatsdClient
-	Decoder     *schema.Decoder
+	Cfg     Config
+	Stats   *StatsdClient
+	Decoder *schema.Decoder
 }
 
 type AppStats struct {
@@ -45,6 +45,16 @@ type AppStats struct {
 	currentReqs   int
 	currentWSReqs int
 	totalReqs     int
+}
+
+func (as AppStats) String() string {
+	uptime := time.Since(as.startTime)
+	return fmt.Sprintf("Started at %s - uptime %s. %d reqs, %d ws %d total reqs",
+		as.startTime,
+		uptime,
+		as.currentReqs,
+		as.currentWSReqs,
+		as.totalReqs)
 }
 
 // Represents a gop application. Create with gop.Init(projectName, applicationName)
@@ -55,15 +65,19 @@ type App struct {
 	ProjectName   string
 	GorillaRouter *mux.Router
 	listener      net.Listener
-	wantReq       chan *wantReq
-	doneReq       chan *Req
-	getReqs       chan chan *Req
-	getStats      chan chan AppStats
+	doingShutdown bool
 
-	doingGraceful            bool
+	wantReq  chan *wantReq
+	doneReq  chan *Req
+	getReqs  chan chan *Req
+	getStats chan chan AppStats
+
 	accessLog                *os.File
 	suppressedAccessLogLines int
 	logDir                   string
+	loggerMap                map[string]int
+	logFormatterFactory      LogFormatterFactory
+	configHandlersEnabled    bool
 }
 
 // The function signature your http handlers need.
@@ -81,9 +95,10 @@ type Req struct {
 	RealRemoteIP string
 	IsHTTPS      bool
 	// Only one of these is valid to use...
-	W         *responseWriter
-	WS        *websocket.Conn
-	CanBeSlow bool //set this to true to suppress the "Slow Request" warning
+	W           *responseWriter
+	WS          *websocket.Conn
+	WsCloseChan chan struct{}
+	CanBeSlow   bool //set this to true to suppress the "Slow Request" warning
 }
 
 // Return one of these from a handler to control the error response
@@ -97,6 +112,7 @@ type HTTPError struct {
 func (h HTTPError) Error() string {
 	return fmt.Sprintf("HTTP Error [%d] - %s", h.Code, h.Body)
 }
+
 func (h HTTPError) Write(w *responseWriter) {
 	w.WriteHeader(h.Code)
 	w.Write([]byte(h.Body))
@@ -129,6 +145,25 @@ func ServerError(body string) error {
 	return error(err)
 }
 
+type WebSocketCloseMessage struct {
+	Code int
+	Body string
+}
+
+func (h WebSocketCloseMessage) Error() string {
+	return fmt.Sprintf("%d %s", h.Code, h.Body)
+}
+
+var CloseAbnormalClosure = WebSocketCloseMessage{Code: websocket.CloseAbnormalClosure}
+var ClosePolicyViolation = WebSocketCloseMessage{Code: websocket.ClosePolicyViolation}
+var CloseGoingAway = WebSocketCloseMessage{Code: websocket.CloseGoingAway}
+
+func PolicyViolation(body string) error {
+	err := ClosePolicyViolation
+	err.Body = body
+	return err
+}
+
 // Used for RPC to get a new request
 type wantReq struct {
 	r         *http.Request
@@ -137,27 +172,48 @@ type wantReq struct {
 }
 
 // Set up the application. Reads config. Panic if runtime environment is deficient.
-func Init(projectName, appName string) *App {
-	return doInit(projectName, appName, true)
+func Init(projectName, appName, version string) *App {
+	return doInit(projectName, appName, version, true, &TimberLogFormatterFactory{})
 }
 
 // For test code and command line tools
-func InitCmd(projectName, appName string) *App {
-	return doInit(projectName, appName, false)
+func InitCmd(projectName, appName, version string) *App {
+	return doInit(projectName, appName, version, false, &TimberLogFormatterFactory{})
 }
 
-func doInit(projectName, appName string, requireConfig bool) *App {
+// Set up the application. Reads config. Panic if runtime environment is deficient.
+func InitWithLogFormatter(
+	projectName, appName, version string,
+	logFormatterFactory LogFormatterFactory,
+) *App {
+	return doInit(projectName, appName, version, true, logFormatterFactory)
+}
+
+// For test code and command line tools
+func InitCmdWithLogFormatter(
+	projectName, appName, version string,
+	logFormatterFactory LogFormatterFactory,
+) *App {
+	return doInit(projectName, appName, version, false, logFormatterFactory)
+}
+
+func doInit(
+	projectName, appName, version string,
+	requireConfig bool, logFormatterFactory LogFormatterFactory,
+) *App {
 	app := &App{
 		common: common{
 			Decoder: schema.NewDecoder(),
 		},
-		AppName:       appName,
-		ProjectName:   projectName,
-		GorillaRouter: mux.NewRouter(),
-		wantReq:       make(chan *wantReq),
-		doneReq:       make(chan *Req),
-		getReqs:       make(chan chan *Req),
-		getStats:      make(chan chan AppStats),
+		AppName:             appName,
+		ProjectName:         projectName,
+		GorillaRouter:       mux.NewRouter(),
+		wantReq:             make(chan *wantReq),
+		doneReq:             make(chan *Req),
+		getReqs:             make(chan chan *Req),
+		getStats:            make(chan chan AppStats),
+		loggerMap:           make(map[string]int),
+		logFormatterFactory: logFormatterFactory,
 	}
 
 	app.loadAppConfigFile(requireConfig)
@@ -168,15 +224,35 @@ func doInit(projectName, appName string, requireConfig bool) *App {
 	// http://homepage.ntlworld.com/jonathan.deboynepollard/FGA/linux-thread-problems.html
 	//    app.setUserAndGroup()
 
-	app.initLogging()
+	if version != "" {
+		app.initLogging(version)
+	} else {
+		app.initLogging()
+	}
 
 	maxProcs, _ := app.Cfg.GetInt("gop", "maxprocs", 4*runtime.NumCPU())
-	app.Debug("Setting maxprocs to %d\n", maxProcs)
+	app.Debug("Setting maxprocs to %d", maxProcs)
 	runtime.GOMAXPROCS(maxProcs)
 
 	app.initStatsd()
 
 	return app
+}
+
+// Hostname returns the apps hostname, os.Hostname() by default, but this can
+// be overridden via gop.hostname config. This call is used when setting up
+// logging and stats allowing a gop app to lie about it's hostname, useful in
+// environments where the hostname may be the same across machines.
+func (a *App) Hostname() string {
+	if name, ok := a.Cfg.Get("gop", "hostname", ""); ok {
+		return name
+	}
+	name, err := os.Hostname()
+	if err != nil {
+		// TODO - Is it safe to log here?
+		name = "UNKNOWN"
+	}
+	return name
 }
 
 // Shut down the app cleanly. (Needed to flush logs)
@@ -209,16 +285,6 @@ func (a *App) Finish() {
 // // Can't log at this stage :-/
 // //    a.Info("Running as user %s (%d)", desiredUserName, desiredUser.Uid)
 // }
-
-func (a *App) setProcessGroupForNelly() {
-	// Nelly knows our pid and will check that there is always at
-	// least one process in the process group with the same id as our pid
-	mypid := syscall.Getpid()
-	err := syscall.Setpgid(mypid, mypid)
-	if err != nil {
-		panic(fmt.Sprintf("Failed to setpgid]: %d - %d - %s\n", mypid, mypid, err.Error()))
-	}
-}
 
 // Hands out 'request' objects
 func (a *App) requestMaker() {
@@ -275,7 +341,7 @@ func (a *App) requestMaker() {
 		case doneReq := <-a.doneReq:
 			_, found := openReqs[doneReq.id]
 			if !found {
-				a.Error("BUG! Unknown request id [%d] being retired")
+				a.Errorf("BUG! Unknown request id [%d] being retired", doneReq.id)
 			} else {
 				doneReq.finished(appStats)
 				appStats.currentReqs--
@@ -309,6 +375,11 @@ func (a *App) GetStats() AppStats {
 	return appStats
 }
 
+// Uptime returns time instant the app was initialized.
+func (a *App) StartTime() time.Time {
+	return a.GetStats().startTime
+}
+
 // Ask requestMaker for a request
 func (a *App) getReq(r *http.Request, websocket bool) *Req {
 	reply := make(chan *Req)
@@ -328,21 +399,18 @@ func (g *Req) finished(appStats AppStats) {
 		return
 	}
 
-	codeStatsKey := fmt.Sprintf("http_status.%d", g.W.code)
+	var code int
+	if g.W != nil {
+		code = g.W.code
+	}
+	codeStatsKey := fmt.Sprintf("http_status.%d", code)
 	g.app.Stats.Inc(codeStatsKey, 1)
 
 	slowReqSecs, _ := g.Cfg.GetFloat32("gop", "slow_req_secs", 10)
 	if reqDuration.Seconds() > float64(slowReqSecs) && !g.CanBeSlow {
-		g.Error("Slow request [%s] took %s", g.R.URL, reqDuration)
+		g.Errorf("Slow request [%s] took %s", g.R.URL.Host, reqDuration)
 	} else {
 		g.Debug("Request took %s", reqDuration)
-	}
-
-	// Tidy up request finalistion (requestMaker, req.finish() method, app.requestFinished())
-	restartReqs, _ := g.Cfg.GetInt("gop", "max_requests", 0)
-	if restartReqs > 0 && appStats.totalReqs > restartReqs {
-		g.Error("Graceful restart after max_requests: %d", restartReqs)
-		g.app.StartGracefulRestart("Max requests reached")
 	}
 
 	gcEveryReqs, _ := g.Cfg.GetInt("gop", "gc_requests", 0)
@@ -378,7 +446,7 @@ func (g *Req) SendHtml(v []byte) error {
 func (g *Req) SendJson(what string, v interface{}) error {
 	json, err := json.Marshal(v)
 	if err != nil {
-		g.Error("Failed to encode %s as json: %s", what, err.Error())
+		g.Errorf("Failed to encode %s as json: %s", what, err.Error())
 		return ServerError("Failed to encode json: " + err.Error())
 	}
 	return g.send("application/json", append(json, '\n'))
@@ -435,9 +503,10 @@ func (g *Req) ParamBool(key string) (bool, error) {
 }
 
 func (a *App) watchdog() {
-	repeat, _ := a.Cfg.GetInt("gop", "watchdog_secs", 300)
+	repeat, _ := a.Cfg.GetInt("gop", "watchdog_secs", 30)
 	ticker := time.Tick(time.Second * time.Duration(repeat))
 
+	firstLoop := true
 	for {
 		sysMemBytesLimit, _ := a.Cfg.GetInt64("gop", "sysmem_bytes_limit", 0)
 		allocMemBytesLimit, _ := a.Cfg.GetInt64("gop", "allocmem_bytes_limit", 0)
@@ -448,46 +517,64 @@ func (a *App) watchdog() {
 		numFDs, err := fdsInUse()
 		numGoros := int64(runtime.NumGoroutine())
 		if err != nil {
-			a.Error("Failed to get number of fds in use: %s", err.Error())
+			a.Debug("Failed to get number of fds in use: %s", err.Error())
 			// Continue without
 		}
 
 		appStats := a.GetStats()
-		a.Info("TICK: sys=%d,alloc=%d,fds=%d,current_req=%d,total_req=%d,goros=%d",
+		gcStats := debug.GCStats{PauseQuantiles: make([]time.Duration, 3)}
+		debug.ReadGCStats(&gcStats)
+		gcMin := gcStats.PauseQuantiles[0]
+		gcMedian := gcStats.PauseQuantiles[1]
+		gcMax := gcStats.PauseQuantiles[2]
+		a.Info("TICK: sys=%d,alloc=%d,fds=%d,current_req=%d,total_req=%d,goros=%d,gc=%v/%v/%v",
 			sysMemBytes,
 			allocMemBytes,
 			numFDs,
 			appStats.currentReqs,
 			appStats.totalReqs,
-			numGoros)
-		a.Stats.Gauge("mem.sys", sysMemBytes)
-		a.Stats.Gauge("mem.alloc", allocMemBytes)
-		a.Stats.Gauge("numfds", numFDs)
-		a.Stats.Gauge("numgoro", numGoros)
+			numGoros,
+			gcMin,
+			gcMedian,
+			gcMax)
+		if firstLoop {
+			// Zero some gauges at start, otherwise restarts get lost in the graphs
+			// and it looks like app is continously using memory.
+			a.Stats.Gauge("mem.sys", 0)
+			a.Stats.Gauge("mem.alloc", 0)
+			a.Stats.Gauge("numfds", 0)
+			a.Stats.Gauge("numgoro", 0)
+		} else {
+			a.Stats.Gauge("mem.sys", sysMemBytes)
+			a.Stats.Gauge("mem.alloc", allocMemBytes)
+			a.Stats.Gauge("numfds", numFDs)
+			a.Stats.Gauge("numgoro", numGoros)
+		}
 
 		if sysMemBytesLimit > 0 && sysMemBytes >= sysMemBytesLimit {
-			a.Error("SYS MEM LIMIT REACHED [%d >= %d] - starting graceful restart", sysMemBytes, sysMemBytesLimit)
-			a.StartGracefulRestart("Sys Memory limit reached")
+			a.Errorf("SYS MEM LIMIT REACHED [%d >= %d] - exiting", sysMemBytes, sysMemBytesLimit)
+			a.Shutdown("Sys Memory limit reached")
 		}
 		if allocMemBytesLimit > 0 && allocMemBytes >= allocMemBytesLimit {
-			a.Error("ALLOC MEM LIMIT REACHED [%d >= %d] - starting graceful restart", allocMemBytes, allocMemBytesLimit)
-			a.StartGracefulRestart("Alloc Memory limit reached")
+			a.Errorf("ALLOC MEM LIMIT REACHED [%d >= %d] - exiting", allocMemBytes, allocMemBytesLimit)
+			a.Shutdown("Alloc Memory limit reached")
 		}
 		if numFDsLimit > 0 && numFDs >= numFDsLimit {
-			a.Error("NUM FDS LIMIT REACHED [%d >= %d] - starting graceful restart", numFDs, numFDsLimit)
-			a.StartGracefulRestart("Number of fds limit reached")
+			a.Errorf("NUM FDS LIMIT REACHED [%d >= %d] - exiting", numFDs, numFDsLimit)
+			a.Shutdown("Number of fds limit reached")
 		}
 		if numGorosLimit > 0 && numGoros >= numGorosLimit {
-			a.Error("NUM GOROS LIMIT REACHED [%d >= %d] - starting graceful restart", numGoros, numGorosLimit)
-			a.StartGracefulRestart("Number of goros limit reached")
+			a.Errorf("NUM GOROS LIMIT REACHED [%d >= %d] - exiting", numGoros, numGorosLimit)
+			a.Shutdown("Number of goros limit reached")
 		}
 
-		restartAfterSecs, _ := a.Cfg.GetFloat32("gop", "restart_after_secs", 0)
+		exitAfterSecs, _ := a.Cfg.GetFloat32("gop", "exit_after_secs", 0)
 		appRunTime := time.Since(appStats.startTime).Seconds()
-		if restartAfterSecs > 0 && appRunTime > float64(restartAfterSecs) {
-			a.Error("TIME LIMIT REACHED [%f >= %f] - starting graceful restart", appRunTime, restartAfterSecs)
-			a.StartGracefulRestart("Run time limit reached")
+		if exitAfterSecs > 0 && appRunTime > float64(exitAfterSecs) {
+			a.Errorf("TIME LIMIT REACHED [%f >= %f] - exiting", appRunTime, exitAfterSecs)
+			a.Shutdown("Run time limit reached")
 		}
+		firstLoop = false
 		<-ticker
 	}
 }
@@ -522,6 +609,10 @@ func (w *responseWriter) HasWritten() bool {
 	return w.size > 0
 }
 
+func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return w.ResponseWriter.(http.Hijacker).Hijack()
+}
+
 func dealWithPanic(g *Req, showInResponse, showInLog, showAllInBacktrace bool, panicHTTPMessage string) {
 	r := recover()
 	if r == nil {
@@ -530,16 +621,26 @@ func dealWithPanic(g *Req, showInResponse, showInLog, showAllInBacktrace bool, p
 	}
 
 	// Build an error to write
-	httpErr := HTTPError{
-		Code: http.StatusInternalServerError,
+	var errBody string
+	var errCode int
+	if g.WS != nil {
+		errCode = websocket.CloseAbnormalClosure
+	} else {
+		errCode = http.StatusInternalServerError
 	}
+
 	sawHTTPErrorPanic := false
 
 	// If we can get a string out of the recovered data, do so
 	var recoveredMessage string
 	switch r := r.(type) {
+	case WebSocketCloseMessage:
+		errCode = r.Code
+		errBody = r.Body
+		sawHTTPErrorPanic = true
 	case HTTPError:
-		httpErr = r
+		errCode = r.Code
+		errBody = r.Body
 		sawHTTPErrorPanic = true
 	case error:
 		recoveredMessage = r.Error()
@@ -553,9 +654,9 @@ func dealWithPanic(g *Req, showInResponse, showInLog, showAllInBacktrace bool, p
 
 	// Use custom panic message if we have one (and no panic'd HTTPError)
 	if !sawHTTPErrorPanic {
-		httpErr.Body = panicHTTPMessage
-		if httpErr.Body == "" {
-			httpErr.Body = "PANIC: " + recoveredMessage
+		errBody = panicHTTPMessage
+		if errBody == "" {
+			errBody = "PANIC: " + recoveredMessage
 		}
 	}
 
@@ -563,18 +664,24 @@ func dealWithPanic(g *Req, showInResponse, showInLog, showAllInBacktrace bool, p
 		g.Error("PANIC - sending panic'd error to client")
 	} else if showInResponse {
 		g.Error("PANIC - sending backtrace to client")
-		httpErr.Body += "\n\n" + string(getBackTrace(showAllInBacktrace))
+		errBody += "\n\n" + string(getBackTrace(showAllInBacktrace))
 	} else {
 		g.Error("PANIC - sending info to client")
 	}
 
 	if showInLog {
-		g.Error("PANIC: " + string(getBackTrace(showAllInBacktrace)))
+		g.Error("PANIC: " + recoveredMessage + string(getBackTrace(showAllInBacktrace)))
 	}
 
-	if g.W.HasWritten() {
-		g.Error("PANIC after handler had written data: %s", httpErr.Body)
+	if g.WS != nil {
+		g.webSocketClose(errCode, errBody)
+	} else if g.W != nil && g.W.HasWritten() {
+		g.Errorf("PANIC after handler had written data: %s", errBody)
 	} else {
+		httpErr := HTTPError{
+			Code: errCode,
+			Body: errBody,
+		}
 		httpErr.Write(g.W)
 	}
 }
@@ -599,9 +706,12 @@ func (a *App) WrapHandler(h HandlerFunc, requiredParams ...string) http.HandlerF
 var wsUpgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
 }
 
-func (a *App) wrapHandlerInternal(h HandlerFunc, websocket bool, requiredParams ...string) http.HandlerFunc {
+func (a *App) wrapHandlerInternal(h HandlerFunc, isWebsocket bool, requiredParams ...string) http.HandlerFunc {
 	panicHTTPMessage, _ := a.Cfg.Get("gop", "panic_http_message", "")
 	showInLog, _ := a.Cfg.GetBool("gop", "panic_backtrace_to_log", false)
 	showInResponse, _ := a.Cfg.GetBool("gop", "panic_backtrace_in_response", false)
@@ -609,11 +719,12 @@ func (a *App) wrapHandlerInternal(h HandlerFunc, websocket bool, requiredParams 
 
 	// Wrap the handler, so we can do before/after logic
 	f := func(w http.ResponseWriter, r *http.Request) {
-		gopRequest := a.getReq(r, websocket)
+		gopRequest := a.getReq(r, isWebsocket)
 		defer func() {
 			a.doneReq <- gopRequest
 		}()
-		if websocket {
+
+		if isWebsocket {
 			ws, err := wsUpgrader.Upgrade(w, r, nil)
 			gopRequest.WS = ws
 			if err != nil {
@@ -622,6 +733,18 @@ func (a *App) wrapHandlerInternal(h HandlerFunc, websocket bool, requiredParams 
 				http.Error(w, errStr, http.StatusInternalServerError)
 				return
 			}
+
+			gopRequest.WsCloseChan = make(chan struct{})
+			go func() {
+				for {
+					// TODO: expose the reader to the handler
+					if _, _, err := gopRequest.WS.NextReader(); err != nil {
+						gopRequest.WS.Close()
+						close(gopRequest.WsCloseChan)
+						break
+					}
+				}
+			}()
 		} else {
 			gopWriter := responseWriter{code: 200, ResponseWriter: w}
 			gopRequest.W = &gopWriter
@@ -647,19 +770,23 @@ func (a *App) wrapHandlerInternal(h HandlerFunc, websocket bool, requiredParams 
 		}
 
 		if err != nil {
-			httpErr, ok := err.(HTTPError)
-			if !ok {
-				httpErr = HTTPError{
-					Code: http.StatusInternalServerError,
-					Body: "Internal error: " + err.Error(),
-				}
-			}
-			if gopRequest.W.HasWritten() {
-				// Ah. We have an error we'd like to send. But it's too late.
-				// Bad handler, no biscuit.
-				a.Error("Handler returned http error after writing data [%s] - discarding error", httpErr)
+			if gopRequest.WS != nil {
+				gopRequest.webSocketError(err)
 			} else {
-				httpErr.Write(gopRequest.W)
+				httpErr, ok := err.(HTTPError)
+				if !ok {
+					httpErr = HTTPError{
+						Code: http.StatusInternalServerError,
+						Body: "Internal error: " + err.Error(),
+					}
+				}
+				if gopRequest.W != nil && gopRequest.W.HasWritten() {
+					// Ah. We have an error we'd like to send. But it's too late.
+					// Bad handler, no biscuit.
+					a.Errorf("Handler returned http error after writing data [%s] - discarding error", httpErr)
+				} else {
+					httpErr.Write(gopRequest.W)
+				}
 			}
 		}
 	}
@@ -707,32 +834,44 @@ func (a *App) HandleMap(hm map[string]func(g *Req) error) {
 }
 
 func (a *App) Run() {
-	a.setProcessGroupForNelly()
+	a.Start()
+	a.ConfigServe()
+}
 
-	a.goAgainSetup()
-
+func (a *App) Start() {
 	a.registerGopHandlers()
-
 	go a.watchdog()
-
 	go a.requestMaker()
+}
 
+func (a *App) ConfigServe() {
 	listenAddr, _ := a.Cfg.Get("gop", "listen_addr", ":http")
 	listenNet, _ := a.Cfg.Get("gop", "listen_net", "tcp")
-	gracefulRestart, _ := a.Cfg.GetBool("gop", "graceful_restart", true)
-	if gracefulRestart {
-		a.goAgainListenAndServe(listenNet, listenAddr)
-	} else {
-		listener, err := net.Listen(listenNet, listenAddr)
-		if err != nil {
-			a.Fatalf("Can't listen on [%s:%s]: %s", listenNet, listenAddr, err.Error())
-		}
-		a.Serve(listener)
+
+	listener, err := net.Listen(listenNet, listenAddr)
+	if err != nil {
+		a.Fatalf("Can't listen on [%s:%s]: %s", listenNet, listenAddr, err.Error())
 	}
+	a.Serve(listener)
 }
 
 func (a *App) Serve(l net.Listener) {
-	http.Serve(l, a.GorillaRouter)
+	a.listener = l
+	http.Serve(a.listener, a.GorillaRouter)
+}
+
+func (a *App) Shutdown(reason string) {
+	a.Infof("Shutting down: %s", reason)
+	// Stop listening for new requests
+	if a.listener != nil {
+		a.listener.Close()
+		a.Infof("Listener stopped")
+	}
+	// TODO: add back grace period for requests to exit
+	a.Infof("Time to die")
+	a.Finish()
+	// TODO: allow control of exit code by caller
+	os.Exit(0)
 }
 
 func getMemInfo() (int64, int64) {
@@ -758,4 +897,54 @@ func (g *Req) WebSocketWriteText(buf []byte) error {
 
 func (g *Req) WebSocketWriteBinary(buf []byte) error {
 	return g.WS.WriteMessage(websocket.BinaryMessage, buf)
+}
+
+// webSocketClose initiates closing the websocket connection on
+// the gop request and waits a short time for the WsCloseChan to close
+// before forcefully closing the connection. This doesn't need to be called
+// if the client closed the connection.
+func (g *Req) webSocketClose(code int, text string) {
+	data := websocket.FormatCloseMessage(code, text)
+	if err := g.WS.WriteMessage(websocket.CloseMessage, data); err != nil {
+		g.Errorf("write websocket close message: %v", err)
+		g.WS.Close()
+		return
+	}
+
+	select {
+	case <-g.WsCloseChan:
+	case <-time.After(time.Second):
+		g.Debug("close websocket timeout")
+		g.WS.Close()
+	}
+}
+
+func (g *Req) webSocketError(err error) {
+	var closeMessage WebSocketCloseMessage
+	switch t := err.(type) {
+	case WebSocketCloseMessage:
+		closeMessage = t
+	case HTTPError:
+		closeMessage = websocketCloseMessageFromHTTPError(t)
+	default:
+		closeMessage = CloseAbnormalClosure
+	}
+
+	g.webSocketClose(closeMessage.Code, closeMessage.Body)
+}
+
+func websocketCloseMessageFromHTTPError(err HTTPError) WebSocketCloseMessage {
+	var closeCode int
+	switch err.Code / 100 {
+	case 2:
+		closeCode = websocket.CloseNormalClosure
+	case 4:
+		closeCode = websocket.ClosePolicyViolation
+	case 5:
+		closeCode = websocket.CloseInternalServerErr
+	default:
+		closeCode = websocket.CloseAbnormalClosure
+	}
+
+	return WebSocketCloseMessage{Code: closeCode, Body: err.Body}
 }

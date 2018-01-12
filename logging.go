@@ -1,22 +1,45 @@
 package gop
 
 import (
+	"errors"
 	"fmt"
-	"github.com/jbert/timber"
 	"log"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/cocoonlife/timber"
 )
 
+type LogFormatterFactory interface {
+	Create() timber.LogFormatter
+}
+
+type TimberLogFormatterFactory struct {
+}
+
+func (t *TimberLogFormatterFactory) Create() timber.LogFormatter {
+	return timber.NewJSONFormatter()
+}
+
 type Logger timber.Logger
+
+func string2Level(logLevelStr string) (timber.Level, error) {
+	logLevelStr = strings.ToUpper(logLevelStr)
+	for logLevel, levelStr := range timber.LongLevelStrings {
+		if logLevelStr == levelStr {
+			return timber.Level(logLevel), nil
+		}
+	}
+	return 0, errors.New("Not found")
+}
 
 func (a *App) makeConfigLogger() (timber.ConfigLogger, bool) {
 	defaultLogPattern := "[%D %T] [%L] %M"
 	filenamesByDefault, _ := a.Cfg.GetBool("gop", "log_filename", false)
 	if filenamesByDefault {
-		defaultLogPattern = "[%D %T] [%L] %S %M"
+		defaultLogPattern = "[%D %T] [%L] %s %M"
 	}
 	logPattern, _ := a.Cfg.Get("gop", "log_pattern", defaultLogPattern)
 
@@ -35,13 +58,13 @@ func (a *App) makeConfigLogger() (timber.ConfigLogger, bool) {
 		defaultLogFname := a.logDir + "/" + a.AppName + ".log"
 		logFname, _ := a.Cfg.Get("gop", "log_file", defaultLogFname)
 
-		newWriter, err := timber.NewFileWriter(logFname)
 		_, dirExistsErr := os.Stat(a.logDir)
 		if dirExistsErr != nil && os.IsNotExist(dirExistsErr) {
 			// Carry on with stdout logging, but remember to mention it
 			fellbackToCWD = true
 			a.logDir = "."
 		} else {
+			newWriter, err := timber.NewFileWriter(logFname)
 			if err != nil {
 				panic(fmt.Sprintf("Can't open log file: %s", err))
 			}
@@ -50,32 +73,73 @@ func (a *App) makeConfigLogger() (timber.ConfigLogger, bool) {
 	}
 
 	logLevelStr, _ := a.Cfg.Get("gop", "log_level", "INFO")
-	logLevelStr = strings.ToUpper(logLevelStr)
-	for logLevel, levelStr := range timber.LongLevelStrings {
-		if logLevelStr == levelStr {
-			configLogger.Level = timber.Level(logLevel)
-			break
+	logLevel, err := string2Level(logLevelStr)
+	if err == nil {
+		configLogger.Level = timber.Level(logLevel)
+	}
+
+	granularsPrefix, _ := a.Cfg.Get("gop", "log_granulars_prefix", "")
+	granularsStrs, _ := a.Cfg.GetList("gop", "log_granulars", nil)
+	if granularsStrs != nil {
+		configLogger.Granulars = make(map[string]timber.Level)
+	GRANULARS:
+		for _, granStr := range granularsStrs {
+			bits := strings.Split(granStr, ":")
+			if len(bits) != 2 {
+				continue GRANULARS
+			}
+			pkgPart := bits[0]
+			pkgLevel := bits[1]
+
+			if pkgPart == "" || pkgLevel == "" {
+				continue GRANULARS
+			}
+			pkgName := pkgPart
+			if granularsPrefix != "" {
+				pkgName = granularsPrefix + "/" + pkgPart
+			}
+			logLevel, err := string2Level(pkgLevel)
+			if err == nil {
+				configLogger.Granulars[pkgName] = logLevel
+			}
 		}
 	}
 
 	return configLogger, fellbackToCWD
 }
 
-func (a *App) initLogging() {
+func (a *App) setLogger(name string, logger timber.ConfigLogger) {
+	l := timber.Global
+	if i, ok := a.loggerMap[name]; ok {
+		l.SetLogger(i, logger)
+	} else {
+		a.loggerMap[name] = l.AddLogger(logger)
+	}
+}
 
-	configLogger, fellbackToCWD := a.makeConfigLogger()
-
+func (a *App) initLogging(extraTags ...string) {
 	// *Don't* create a NewTImber here. Logs are only flushed on Close() and if we
 	// have more than one timber, it's easy to only Close() one of them...
 	l := timber.Global
-
 	a.Logger = l
-	a.loggerIndex = l.AddLogger(configLogger)
 
 	// Set up the default go logger to go here too, so 3rd party
 	// module logging plays nicely
 	log.SetFlags(0)
 	log.SetOutput(l)
+
+	a.configureLogging(extraTags)
+	a.Cfg.AddOnChangeCallback(func(cfg *Config) { a.configureLogging() })
+}
+
+func (a *App) configureLogging(extraTags ...string) {
+	l := timber.Global
+
+	configLogger, fellbackToCWD := a.makeConfigLogger()
+	a.setLogger("configLogger", configLogger)
+	if fellbackToCWD {
+		l.Error("Logging directory does not exist - logging to stdout")
+	}
 
 	doAccessLog, _ := a.Cfg.GetBool("gop", "access_log_enable", false)
 	if doAccessLog {
@@ -85,27 +149,38 @@ func (a *App) initLogging() {
 		var err error
 		a.accessLog, err = os.OpenFile(accessLogFilename, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
 		if err != nil {
-			l.Error("Can't open access log; %s", err.Error())
+			l.Errorf("Can't open access log; %s", err.Error())
 		}
 	}
 
-	if fellbackToCWD {
-		l.Error("Logging directory does not exist - logging to stdout")
+	// Loggly logging service
+	token, haveToken := a.Cfg.Get("gop", "log_loggly_token", "")
+	if haveToken {
+		level, _ := a.Cfg.Get("gop", "log_level", "info")
+		// ToUpper used because that's how timber expects the levels
+		// to be written
+		level = strings.ToUpper(level)
+		tags := []string{a.ProjectName, a.AppName, a.Hostname()}
+		tags = append(tags, extraTags...)
+		if lw, err := NewLogglyWriter(token, tags...); err == nil {
+			logger := timber.ConfigLogger{
+				LogWriter: lw,
+				Level:     timber.GetLevel(level),
+				Formatter: a.logFormatterFactory.Create(),
+			}
+			a.setLogger("loggly", logger)
+			l.Infof("Added Loggly logger with tags:%s", tags)
+		} else {
+			l.Errorf("Error creating loggly client: %s", err.Error())
+		}
 	}
-	a.Cfg.AddOnChangeCallback(func(cfg *Config) { a.resetLogging() })
-}
-
-func (a *App) resetLogging() {
-	configLogger, _ := a.makeConfigLogger()
-	l := timber.Global
-	l.SetLogger(a.loggerIndex, configLogger)
 }
 
 func (a *App) closeLogging() {
 	if a.accessLog != nil {
 		err := a.accessLog.Close()
 		if err != nil {
-			a.Error("Error closing access log: %s", err.Error())
+			a.Errorf("Error closing access log: %s", err.Error())
 		}
 	}
 	timber.Close()
@@ -149,7 +224,12 @@ func (a *App) WriteAccessLog(req *Req, dur time.Duration) {
 	if uaLine == "" {
 		uaLine = "-"
 	}
-	hostname, _ := os.Hostname()
+	var size, code int
+	if req.W != nil {
+		code = req.W.code
+		size = req.W.size
+	}
+	hostname := a.Hostname()
 	logLine := fmt.Sprintf("%s %.3f %s %s %s %s %s %d %d %s %s\n",
 		hostname,
 		dur.Seconds(),
@@ -159,12 +239,12 @@ func (a *App) WriteAccessLog(req *Req, dur time.Duration) {
 		//		req.startTime.Format("[02/Jan/2006:15:04:05 -0700]"),
 		req.startTime.Format("["+time.RFC3339+"]"),
 		quote(reqFirstLine),
-		req.W.code,
-		req.W.size,
+		code,
+		size,
 		quote(referrerLine),
 		quote(uaLine))
 	_, err := req.app.accessLog.WriteString(logLine)
 	if err != nil {
-		a.Error("Failed to write to access log: %s", err.Error())
+		a.Errorf("Failed to write to access log: %s", err.Error())
 	}
 }
